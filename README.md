@@ -13,6 +13,8 @@ Ultra sound Fetal Age Machine Learning Initiative
 
 3.2 Install x11 and gl libraries: apt-get update; apt-get install libx11-6 libgl1 libopengl0
 
+3.3 If installing vtk egl the path to python packages is at /usr/local/lib/python3.6/dist-packages
+
 4. Commit the container and use this one, remember to start it as normal user (use flag -u $(id -u):$(id -g)). 
 
 5. Installing with conda
