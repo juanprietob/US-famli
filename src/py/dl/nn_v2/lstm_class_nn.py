@@ -20,59 +20,77 @@ class NN(tf.keras.Model):
         decay_rate = args.decay_rate
         staircase = args.staircase
         drop_prob = args.drop_prob
-        sample_weight = args.sample_weight
 
         data_description = tf_inputs.get_data_description()
-        self.num_channels = data_description[data_description["data_keys"][1]]["shape"][-1]
+        self.num_channels = data_description[data_description["data_keys"][0]]["shape"][-1]
 
         self.num_classes = 2
-        if(data_description[data_description["data_keys"][1]]["num_class"]):
-            self.num_classes = data_description[data_description["data_keys"][1]]["num_class"]
-            print("Number of classes in data description", self.num_classes)
+        self.class_weights_index = -1
+        self.enumerate_index = 1
+
+        if "enumerate" in data_description:
+            self.enumerate_index = data_description["data_keys"].index(data_description["enumerate"])
+
+            if(data_description[data_description["data_keys"][self.enumerate_index]]["num_class"]):
+                self.num_classes = data_description[data_description["data_keys"][self.enumerate_index]]["num_class"]
+                print("Number of classes in data description", self.num_classes)
+                if "class_weights" in data_description["data_keys"]:
+                    self.class_weights_index = data_description["data_keys"].index("class_weights")
+                    print("Using weights index", self.class_weights_index)
 
         self.drop_prob = drop_prob
 
         self.lstm_class = self.make_lstm_network()
         self.lstm_class.summary()
-
-        # self.classification_loss = tf.keras.losses.CategoricalCrossentropy(from_logits=True)
-        self.classification_loss = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
-        self.sample_weight = None
-        if(sample_weight is not None):
-            self.sample_weight = tf.constant(np.reshape(np.multiply(np.ones([args.batch_size, self.num_classes]), sample_weight), [args.batch_size, self.num_classes, 1]), dtype=tf.float32)
-            print("Weights:", self.sample_weight.numpy())
+        
+        # self.classification_loss = tf.keras.losses.SparseCategoricalCrossentropy()
+        label_smoothing = 0
+        self.classification_loss = tf.keras.losses.CategoricalCrossentropy(label_smoothing=label_smoothing)
             
         self.metrics_acc = tf.keras.metrics.Accuracy()
 
-        lr = tf.keras.optimizers.schedules.ExponentialDecay(learning_rate, decay_steps, decay_rate, staircase)
+        if decay_rate != 0.0:
+            lr = tf.keras.optimizers.schedules.ExponentialDecay(learning_rate, decay_steps, decay_rate, staircase)
+        else:
+            lr = learning_rate
+
         self.optimizer = tf.keras.optimizers.Adam(lr)
+        
+        # self.metrics_validation = tf.keras.metrics.SparseCategoricalCrossentropy()
+        self.metrics_validation = tf.keras.metrics.CategoricalCrossentropy(label_smoothing=label_smoothing)
+        self.metrics_acc_validation = tf.keras.metrics.Accuracy()
+        self.global_validation_metric = float("inf")
+        self.global_validation_step = args.in_epoch
 
     def make_lstm_network(self):
-        model = tf.keras.Sequential()
 
-        model.add(tf.keras.layers.BatchNormalization(input_shape=(64, 256, 256, 4)))
-        model.add(tf.keras.layers.ConvLSTM2D(filters=64, kernel_size=(5, 5), strides=(4, 4), activation='tanh', use_bias=False, padding='same'))
-        model.add(tf.keras.layers.Conv2D(filters=128, kernel_size=(3, 3), strides=(2, 2), activation=tf.keras.layers.LeakyReLU(), use_bias=False, padding='same'))
-        model.add(tf.keras.layers.Conv2D(filters=256, kernel_size=(3, 3), strides=(2, 2), activation=tf.keras.layers.LeakyReLU(), use_bias=False, padding='same'))
-        model.add(tf.keras.layers.Conv2D(filters=512, kernel_size=(3, 3), strides=(2, 2), activation=tf.keras.layers.LeakyReLU(), use_bias=False, padding='same'))
-        model.add(tf.keras.layers.Conv2D(filters=1024, kernel_size=(3, 3), strides=(2, 2), activation=tf.keras.layers.LeakyReLU(), use_bias=False, padding='same'))
-        model.add(tf.keras.layers.Reshape(target_shape=(4*4*1024,)))
-        model.add(tf.keras.layers.Dense(self.num_classes))
+        x0 = tf.keras.Input(shape=[None, 8, 8, self.num_channels])
 
-        return model
+        x = layers.ConvLSTM2D(1024, (3, 3), strides=(2, 2), padding='same', activation='tanh', use_bias=False, unit_forget_bias=False, return_sequences=True)(x0)
+
+        x = layers.GlobalMaxPooling3D()(x)
+
+        x = layers.Dense(self.num_classes, activation='softmax', name='predictions')(x)
+
+        return tf.keras.Model(inputs=x0, outputs=x) 
 
 
     @tf.function
     def train_step(self, train_tuple):
         
         images = train_tuple[0]
-        labels = train_tuple[1]
+        labels = train_tuple[self.enumerate_index]
+        sample_weight = None
+
+        if self.class_weights_index != -1:
+            sample_weight = train_tuple[self.class_weights_index]
 
         with tf.GradientTape() as tape:
             
-            x_c = self.lstm_class(images)
-            labels = tf.one_hot(labels, self.num_classes, axis=1)
-            loss = self.classification_loss(labels, x_c, sample_weight=self.sample_weight)
+            # images = tf.map_fn(lambda x: tf.random.shuffle(x), images)
+            x_c = self.lstm_class(images, training=True)
+            # loss = self.classification_loss(labels, x_c, sample_weight=sample_weight)
+            loss = self.classification_loss(tf.reshape(tf.one_hot(tf.cast(labels, tf.int32), self.num_classes), tf.shape(x_c)), x_c, sample_weight=sample_weight)
 
             var_list = self.trainable_variables
 
@@ -81,26 +99,65 @@ class NN(tf.keras.Model):
 
             return loss, x_c
 
+    def valid_step(self, dataset_validation):
+
+        for valid_tuple in dataset_validation:
+            images = valid_tuple[0]
+            labels = valid_tuple[self.enumerate_index]
+            
+            x_c = self.lstm_class(images, training=False)
+
+            # self.metrics_validation.update_state(labels, x_c)
+            
+            sample_weight = None
+            if self.class_weights_index != -1:
+                sample_weight = valid_tuple[self.class_weights_index]
+            self.metrics_validation.update_state(tf.reshape(tf.one_hot(tf.cast(labels, tf.int32), self.num_classes), tf.shape(x_c)), x_c, sample_weight=sample_weight)
+
+            prediction = tf.argmax(x_c, axis=1)
+            self.metrics_acc_validation.update_state(labels, prediction, sample_weight=sample_weight)
+
+        validation_result = self.metrics_validation.result()
+        acc_result = self.metrics_acc_validation.result()
+        tf.summary.scalar('validation_loss', validation_result, step=self.global_validation_step)
+        tf.summary.scalar('validation_acc', acc_result, step=self.global_validation_step)
+        self.global_validation_step += 1
+
+        print("validation loss:", validation_result.numpy(), "acc:", acc_result.numpy())
+        improved = False
+        if validation_result < self.global_validation_metric:
+            self.global_validation_metric = validation_result
+            improved = True
+
+        return improved
+
     def get_checkpoint_manager(self):
         return tf.train.Checkpoint(
             lstm_class=self.lstm_class,
             optimizer=self.optimizer)
 
-    def summary(self, images, tr_step, step):
-        labels = tf.reshape(images[1], [-1])
+    def summary(self, train_tuple, tr_step, step):
+        
+        sample_weight = None
+        if self.class_weights_index != -1:
+            sample_weight = train_tuple[self.class_weights_index]
+
+        labels = tf.reshape(train_tuple[1], [-1])
 
         loss = tr_step[0]
-        prediction = tf.argmax(tf.nn.softmax(tr_step[1]), axis=1)
+        prediction = tf.argmax(tr_step[1], axis=1)
 
-        self.metrics_acc.update_state(labels, prediction)
+        self.metrics_acc.update_state(labels, prediction, sample_weight=sample_weight)
         acc_result = self.metrics_acc.result()
 
-        print("step", step, "loss", loss.numpy(), "acc", acc_result.numpy(), labels.numpy(), prediction.numpy())
-        tf.summary.image('real', images[0][:,32,:,:,:]/255, step=step)
+        print("step", step, "loss", loss.numpy(), "acc", acc_result.numpy())
+        print(labels.numpy())
+        print(prediction.numpy())
+        
+        tf.summary.scalar('loss', loss, step=step)
         tf.summary.scalar('loss', loss, step=step)
         tf.summary.scalar('accuracy', acc_result, step=step)
 
     def save_model(self, save_model):
-        model = tf.keras.Sequential(self.lstm_class.layers + [layers.Lambda(lambda x: tf.sigmoid(x))])
-        model.summary()
-        model.save(save_model)
+        self.lstm_class.summary()
+        self.lstm_class.save(save_model)
